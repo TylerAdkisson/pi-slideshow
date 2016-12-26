@@ -17,30 +17,41 @@
 # Free Software Foundation, Inc.,
 # 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #
-# Version: 1.0.4
+# Version: 1.1
 # Authors: Tyler Adkisson
 # Creation_date: 2016-11-05
+# Last_modified: 2016-12-26
 
 import pi3d
 import time, glob, os, signal
+import threading
+from subprocess import Popen, PIPE, STDOUT
 
-FPS = 30
-DISPLAY_TIME = 11.0
-FADE_TIME = 1.0
-ERROR_FADE_TIME = 10.0
-IMAGE_DIR = "/mnt/photos"
-SCAN_TIME_BASE = 10 * 60
-SCAN_TIME_ERROR = 1 * 60
+#
+# Adjust these parameters to fit your needs
+#
+FPS = 30							# Render FPS.  In most cases, you should leave this at 30
+DISPLAY_TIME = 11.0					# How long to display each image, in seconds
+FADE_TIME = 1.0						# Image fade duration, in seconds
+ERROR_FADE_TIME = 10.0				# Error screen fade in duration, in seconds
+IMAGE_DIR = "/mnt/photos/photos"	# Path containing jpg images (must be lower-case '.jpg' in filenames)
+MUSIC_DIR = "/mnt/photos/music"		# Path containing mp3 music tracks, if desired
+SCAN_TIME_BASE = 5 * 60				# How often to scan for new images/music
+SCAN_TIME_ERROR = 1 * 60			# How often to scan while displaying the error image
 SCAN_TIME = SCAN_TIME_BASE
-ERROR_DIM_TIME = 10 * 60
-FAIL_COUNT_TRIGGER = 5 # The number of failed loads in a row before scanning the dir again
+ERROR_DIM_TIME = 10 * 60			# How long to wait before dimming the display while displaying the error image (displays black.png semi-transparent on top)
+FAIL_COUNT_TRIGGER = 5				# The number of failed loads in a row before scanning the dir again
+
 
 # Set up display
+# The display is run at whatever resolution the console is currently running at
 display = pi3d.Display.create(background=(0.0, 0.0, 0.0, 1.0), frames_per_second=FPS)
 shader = pi3d.Shader("2d_flat")
 #transitionStep = 1.0 / (FPS * FADE_TIME);
 #errorTransitionStep = 1.0 / (FPS * ERROR_FADE_TIME);
 fileList = [None]
+audioPlayer = None
+audioFileList = [None]
 
 # Variables
 currentIndex = -1
@@ -191,9 +202,166 @@ class Slide(pi3d.Canvas):
 		if self.fade_status:
 			self._fade_direction = 0
 
+class AudioPlayer:
+	def __init__(self):
+		# Start mpg321 player with remote control
+		self._playerProcess = None
+		self._isPlaying = False
+		self._lastFilename = ""
+		self._playlist = [None]
+		self._currentPlaylistIndex = 0
+		self._manualStop = False
+		self._isReady = False
+		self._playFailCount = 0
+		self._readAbort = False
+		
+		self._initPlayer()
+	
+	def __del__(self):
+		if self._playerProcess:
+			self.close()
+	
+	@property
+	def isPlaying(self):
+		return self._isPlaying
+		
+	
+	def playFile(self, filename):
+		if self._isPlaying:
+			return
+		
+		# Instruct mpg321 to load a new file
+		self._fileLoaded = False
+		self._writePlayer("LOAD %s" % filename)
+		self._lastFilename = filename
+		self._manualStop = False
+	
+	def loadFileList(self, playlist):
+		self._playlist = list(playlist)
+		# Fix index if it falls off the end of the new playlist
+		if self._currentPlaylistIndex >= len(playlist):
+			self._currentPlaylistIndex = 0
+	
+	def playNextFile(self):
+		self._currentPlaylistIndex += 1
+		if self._currentPlaylistIndex >= len(self._playlist):
+			self._currentPlaylistIndex = 0
+		
+		if len(self._playlist) == 0:
+			return
+		
+		self.playFile(self._playlist[self._currentPlaylistIndex])
+	
+	def stop(self):
+		if not self._isPlaying:
+			return
+		
+		self._manualStop = True
+		self._writePlayer("STOP")
+	
+	def togglePause(self):
+		self._writePlayer("PAUSE")
+	
+	def close(self):
+		self._writePlayer("QUIT")
+		if self._readThread:
+			self._readAbort = True
+			self._readThread.join(2.0)
+		
+		self._playerProcess = None
+	
+	def _initPlayer(self):
+		if self._playerProcess and self._playerProcess.poll() is None:
+			# Still running
+			return
+		
+		self._isReady = False
+		self._playerProcess = Popen([
+			"mpg321",
+			"-R",
+			"-N", "slideshowAudio",
+			"--skip-printing-frames=-1"
+		], stdout=PIPE, stdin=PIPE, stderr=STDOUT)
+		
+		# Read the player's output from a different thread
+		self._readThread = threading.Thread(target=self._innerReadPlayer, name="mpg321 output reader", daemon=True)
+		self._readThread.start()
+		print("[AudioPlayer] Player created")
+	
+	def _writePlayer(self, command):
+		self._playerProcess.poll()
+		if self._playerProcess and self._playerProcess.returncode is None:
+			loopCount = 0;
+			while not self._isReady and loopCount < 10:
+				time.sleep(0.1)
+				loopCount += 1
+			
+			try:
+				print("[AudioPlayer] Send command \"%s\"" % command)
+				self._playerProcess.stdin.write((command + "\n").encode())
+				self._playerProcess.stdin.flush()
+			except BrokenPipeError:
+				print("[AudioPlayer] Player closed")
+	
+	def _innerReadPlayer(self):
+		# Read player output lines forever
+		for line in self._playerProcess.stdout:
+			if self._readAbort:
+				print("[AudioPlayer] Told to abort read thread")
+				break;
+			
+			self._processPlayerLine(line.decode())
+		
+		while self._playerProcess.returncode is None:
+			self._playerProcess.poll()
+			print("[AudioPlayer] Player process not exited yet")
+		if self._playerProcess.returncode != -12 and self._playerProcess.returncode != 0:
+			# Exited badly, restart shortly
+			print("[AudioPlayer] mpg321 return code: %i" % self._playerProcess.returncode)
+			time.sleep(3)
+			self._initPlayer()
+			self._playFailCount += 1
+			if self._playFailCount >= 5:
+				self._isPlaying = False
+				self._playFailCount = 0
+				scanMusic()
+			
+			if len(self._playlist) > 0:
+				self.playNextFile()
+		
+	def _processPlayerLine(self, line):
+		segments = line.split()
+		
+		print(line)
+		
+		if segments[0] == "@R":
+			self._isReady = True
+		elif segments[0] == "@S": # File loaded
+			self._fileLoaded = True
+			self._playFailCount = 0
+			print("[AudioPlayer] Loaded %s" % self._playlist[self._currentPlaylistIndex])
+		elif segments[0] == "@P" and segments[1] == "3" and not self._manualStop: # File finished playing, play next
+			self.playNextFile()
+		elif False and line.startswith(self._playlist[self._currentPlaylistIndex]):
+			# The name of the file last attempted to load is output if there is an error
+			# Try to load the next file
+			self._playFailCount += 1
+			if self._playFailCount >= 5:
+				self._isPlaying = False
+				self._playFailCount = 0
+				scanMusic()
+			
+			if len(self._playlist) > 0:
+				self.playNextFile()
+		
+
 def scanImages():
 	global currentFileIndex, fileList, lastScanTime, isErrored, SCAN_TIME
 	#print("Scanning %s for new images" % IMAGE_DIR)
+	prevFileName = None
+	if fileList and len(fileList) > 0 and currentFileIndex > -1:
+		prevFileName = fileList[currentFileIndex]
+	
 	fileList = sorted(glob.glob(IMAGE_DIR + "/*.*"))
 	#print("scanImages() - Found %i images" % len(fileList))
 	
@@ -203,15 +371,47 @@ def scanImages():
 	else:
 		isErrored = False
 		SCAN_TIME = SCAN_TIME_BASE
-		if currentFileIndex > len(fileList):
-			print("Index %i too far off end" % currentFileIndex)
-			currentFileIndex = -1
+		# Try to find the displaying image index in the new list
+		newIndex = -1
+		if prevFileName:
+			tmpIndex = 0
+			for path in fileList:
+				if path == prevFileName:
+					break
+				tmpIndex += 1
+			
+			# Only set the new index if we actually found the file
+			if tmpIndex != len(fileList):
+				newIndex = tmpIndex
+		
+		currentFileIndex = newIndex
+		#if currentFileIndex > len(fileList):
+		#	print("Index %i too far off end" % currentFileIndex)
+		#	currentFileIndex = -1
 		
 		#if getTime() - lastSwitchTime > (2 * DISPLAY_TIME):
 		#	print("Time since last load is too large %f" % (getTime() - lastSwitchTime))
 		#	loadNextImage()
 	lastScanTime = getTime()
+
+def scanMusic():
+	global audioFileList, audioPlayer
+	audioFileList = sorted(glob.glob(MUSIC_DIR + "/*.mp3"))
 	
+	# In the case where not audio is found, simply don't play any
+	if len(audioFileList) == 0:
+		#print("No audio found, not playing audio")
+		return
+	
+	hasPlayer = audioPlayer is not None
+	if not hasPlayer:
+		audioPlayer = AudioPlayer()
+	
+	audioPlayer.loadFileList(audioFileList)
+	if not hasPlayer:
+		audioPlayer.playNextFile()
+	
+
 def loadNextImage(overridePath=None):
 	global currentFileIndex
 	if not overridePath:
@@ -235,7 +435,7 @@ def switchImage():
 	nextSlide = slides[currentIndex]
 	
 	# Order the slides so transparency works
-	# Z goes from front to back. So a Z of 0.5 is behind a Z of 0
+	# Z goes from front to back, origin at 0.  Thus -1 is in front of 0, which is in front of 1
 	if currentSlide:
 		currentSlide.positionZ(0.1)
 		currentSlide.show()
@@ -299,6 +499,7 @@ fadeOverlay.set_fade_time(ERROR_FADE_TIME)
 
 # Populate image list
 scanImages()
+scanMusic()
 loadNextImage()
 
 #keyboard = pi3d.Keyboard()
@@ -309,6 +510,7 @@ CAMERA.was_moved = False #to save a tiny bit of work each loop
 while display.loop_running():
 	if getTime() - lastScanTime >= SCAN_TIME:
 		scanImages()
+		scanMusic()
 	if (not isErrored) and (getTime() - lastSwitchTime >= DISPLAY_TIME):
 		switchImage()
 	
@@ -348,6 +550,7 @@ while display.loop_running():
 			loadFailures = loadFailures + 1
 			if loadFailures >= FAIL_COUNT_TRIGGER:
 				scanImages()
+				scanMusic()
 				continue
 			time.sleep(2) # Wait before trying again
 	
@@ -357,3 +560,7 @@ while display.loop_running():
 
 # Clean up display
 display.destroy()
+
+# Clean up audio player
+if audioPlayer:
+	audioPlayer.close()
